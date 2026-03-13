@@ -1,11 +1,8 @@
 import hashlib
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from json import loads as json_loads
 from textwrap import wrap
-from typing import Dict, List
-from datetime import datetime, timedelta
 from subprocess import PIPE, Popen
 from threading import Event
 import signal
@@ -13,13 +10,10 @@ import signal
 from pyroute2 import IPRoute
 from pyroute2.netlink.exceptions import NetlinkError
 import argparse
-import signal
 import os
 import sys
-import time
 
 import ipaddress
-import re
 
 RT_PROTO_ID = 129
 RT_PROTO = "wg-vxlan-glue"
@@ -33,7 +27,7 @@ def print_err(msg):
 
 exit_event = Event()
 
-def mac2eui64(mac, prefix=None):
+def mac2eui64(mac, prefix=None) -> str:
     """
     Convert a MAC address to a EUI64 identifier
     or, with prefix provided, a full IPv6 address
@@ -53,13 +47,11 @@ def mac2eui64(mac, prefix=None):
         except Exception:  # pylint: disable=broad-except
             return
 
-#from wgkex.common.utils import mac2eui64
-
 TIMEOUT = timedelta(minutes=3)
 
 class WireGuardPeer:
 
-    def __init__(self, public_key: str, latest_handshake : int = None,
+    def __init__(self, public_key: str, latest_handshake : datetime | None = None,
                  is_installed : bool = False):
         self.public_key = public_key
         self.latest_handshake = latest_handshake
@@ -74,11 +66,13 @@ class WireGuardPeer:
         hash_as_list = wrap(hashed_key, 2)
         temp_mac = ":".join(["02"] + hash_as_list[:5])
 
-        lladdr = re.sub(r"/\d+$", "/128", mac2eui64(mac=temp_mac, prefix="fe80::/10"))
+        lladdr = re.sub(pattern=r"/\d+$", repl="/128", string=mac2eui64(mac=temp_mac, prefix="fe80::/10"))
         return lladdr
 
     @property
     def is_established(self) -> bool:
+        if not self.latest_handshake:
+            return False
         return (datetime.now() - self.latest_handshake) < TIMEOUT
 
     @property
@@ -103,7 +97,7 @@ class ConfigManager:
         self.wg_interface = wg_interface
         self.vx_interface = vx_interface
 
-    def find_by_public_key(self, public_key : str) -> [WireGuardPeer]:
+    def find_by_public_key(self, public_key : str) -> list[WireGuardPeer]:
         try:
             return [self.all_peers[public_key]]
         except KeyError:
@@ -178,9 +172,9 @@ def check_iface_type(iface, type):
 
     with open(f'/sys/class/net/{iface}/uevent', 'r') as f:
         for line in f.readlines():
-            l = line.replace('\n', '').split('=')
-            if l[0] == 'DEVTYPE' and l[1] != type:
-                print(f'Iface {iface} is wrong type! Should be {type}, but is {l[1]}. Exiting...')
+            uevent_entries = line.replace('\n', '').split('=')
+            if uevent_entries[0] == 'DEVTYPE' and uevent_entries[1] != type:
+                print(f'Iface {iface} is wrong type! Should be {type}, but is {uevent_entries[1]}. Exiting...')
                 exit(1)
 
 
