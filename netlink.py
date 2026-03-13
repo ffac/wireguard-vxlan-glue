@@ -6,6 +6,7 @@ from textwrap import wrap
 from subprocess import PIPE, Popen
 from threading import Event
 import signal
+from typing import Literal
 
 from pyroute2 import IPRoute
 from pyroute2.netlink.exceptions import NetlinkError
@@ -89,10 +90,6 @@ class WireGuardPeer:
             return False
         return (datetime.now() - self.latest_handshake) < TIMEOUT
 
-    @property
-    def needs_config(self) -> bool:
-        return self.is_established != self.is_installed
-
     """WireGuardPeer describes complete configuration for a specific WireGuard client
 
     Attributes:
@@ -134,49 +131,69 @@ class ConfigManager:
 
                 peer.latest_handshake = datetime.fromtimestamp(latest_handshake)
 
-    def push_vxlan_configs(self, force_remove = False):
+    def remove_stale_entries(self, force_remove: bool = False):
+        """
+        Remove the entries of all peers which are no longer established.
+        With force_remove, the entries of all installed peers are removed.
+
+        This has to run for all managers before add_new_entries, so that a peer
+        which moved to another wireguard interface has its old route removed
+        before the new one is added.
+        """
         for peer in self.all_peers.values():
-            if force_remove:
-                if not peer.is_installed: continue
-                new_state = False
-            else:
-                if not peer.needs_config: continue
-                new_state = peer.is_established
+            if peer.is_installed and (force_remove or not peer.is_established):
+                self.modify_peer(peer, "del")
 
-            with IPRoute() as ip:
-                try:
-                    ip.fdb(
-                        "append" if new_state else "del",
-                        ifindex=ip.link_lookup(ifname=self.vx_interface)[0],
-                        # mac 00:00:00:00:00:00 means automatic learning
-                        lladdr="00:00:00:00:00:00",
-                        dst=re.sub(r"/\d+$", "", peer.lladdr),
-                    )
-                except NetlinkError as e:
-                    print_err(f"Inserting FDB entry failed for {peer.public_key} on {self.vx_interface}.")
-                    print_err(str(e))
-
-            with IPRoute() as ip:
-                try:
-                    ip.route(
-                        "add" if new_state else "del",
-                        dst=peer.lladdr,
-                        oif=ip.link_lookup(ifname=self.wg_interface)[0],
-                        proto=RT_PROTO_ID,
-                    )
-                except NetlinkError as e:
-                    print_err(f"Inserting FDB entry failed for {peer.public_key} on {self.vx_interface}.")
-                    print_err(str(e))
-
-            if new_state:
-                print(f'Installed route and fdb entry for {peer.public_key} ({self.wg_interface}, {self.vx_interface})')
-            else:
-                print(f'Removed route and fdb entry for {peer.public_key} ({self.wg_interface}, {self.vx_interface}).')
-
-            peer.is_installed = new_state
+    def add_new_entries(self):
+        """
+        Add the entries of all established peers which are not installed yet.
+        """
+        for peer in self.all_peers.values():
+            if peer.is_established and not peer.is_installed:
+                self.modify_peer(peer, "append")
 
     def cleanup(self):
-        self.push_vxlan_configs(force_remove=True)
+        self.remove_stale_entries(force_remove=True)
+
+    def modify_peer(self, peer: WireGuardPeer, modification: Literal["append", "del"]):
+        """
+        Adds or removes an FDB and iproute entry for a given wireguard peer
+        """
+        if modification == "append":
+            action = "Installed"
+            failed_action = "Installing"
+        else:
+            action = "Removed"
+            failed_action = "Removing"
+
+        with IPRoute() as ip:
+            try:
+                ip.fdb(
+                    modification,
+                    ifindex=ip.link_lookup(ifname=self.vx_interface)[0],
+                    # mac 00:00:00:00:00:00 means automatic learning
+                    lladdr="00:00:00:00:00:00",
+                    dst=re.sub(r"/\d+$", "", peer.lladdr),
+                )
+            except NetlinkError as e:
+                print_err(f"{failed_action} FDB entry failed for {peer.public_key} on {self.vx_interface}.")
+                print_err(str(e))
+
+        with IPRoute() as ip:
+            try:
+                ip.route(
+                    "add" if modification == "append" else "del",
+                    dst=peer.lladdr,
+                    oif=ip.link_lookup(ifname=self.wg_interface)[0],
+                    proto=RT_PROTO_ID,
+                )
+            except NetlinkError as e:
+                print_err(f"{failed_action} ip route failed for {peer.public_key} on {self.wg_interface}.")
+                print_err(str(e))
+
+        print(f'{action} route and fdb entry for {peer.public_key} ({self.wg_interface}, {self.vx_interface})')
+
+        peer.is_installed = modification == "append"
 
 
 def check_iface_type(iface, type):
@@ -270,9 +287,12 @@ if __name__ == '__main__':
     while not exit_event.is_set():
         for manager in managers:
             manager.pull_from_wireguard()
-            manager.push_vxlan_configs()
-            if exit_event.is_set():
-                break
+        # remove on all interfaces first, so that a peer which moved to another
+        # interface does not collide with its own old entries
+        for manager in managers:
+            manager.remove_stale_entries()
+        for manager in managers:
+            manager.add_new_entries()
 
         exit_event.wait(10)
 
