@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import re
 from datetime import datetime, timedelta
@@ -140,24 +141,47 @@ class ConfigManager:
         which moved to another wireguard interface has its old route removed
         before the new one is added.
         """
-        for peer in self.all_peers.values():
-            if peer.is_installed and (force_remove or not peer.is_established):
-                self.modify_peer(peer, "del")
+        remove_peers = [
+            peer for peer in self.all_peers.values()
+            if peer.is_installed and (force_remove or not peer.is_established)
+        ]
+        self._apply(remove_peers, "del")
 
     def add_new_entries(self):
         """
         Add the entries of all established peers which are not installed yet.
         """
-        for peer in self.all_peers.values():
-            if peer.is_established and not peer.is_installed:
-                self.modify_peer(peer, "append")
+        add_peers = [
+            peer for peer in self.all_peers.values()
+            if peer.is_established and not peer.is_installed
+        ]
+        self._apply(add_peers, "append")
 
     def cleanup(self):
         self.remove_stale_entries(force_remove=True)
 
-    def modify_peer(self, peer: WireGuardPeer, modification: Literal["append", "del"]):
+    def _apply(self, peers: list[WireGuardPeer], modification: Literal["append", "del"]):
+        if not peers:
+            return
+
+        with IPRoute() as ip:
+            vx_index = ip.link_lookup(ifname=self.vx_interface)
+            wg_index = ip.link_lookup(ifname=self.wg_interface)
+            if not vx_index or not wg_index:
+                print_err(f"Interface {self.vx_interface} or {self.wg_interface} not found, skipping.")
+                return
+
+            for peer in peers:
+                self.modify_peer(ip, vx_index[0], wg_index[0], peer, modification)
+
+    def modify_peer(self, ip: IPRoute, vx_index: int, wg_index: int,
+                    peer: WireGuardPeer, modification: Literal["append", "del"]):
         """
-        Adds or removes an FDB and iproute entry for a given wireguard peer
+        Adds or removes an FDB and iproute entry for a given wireguard peer.
+
+        A peer is only marked as installed if both entries were added successfully,
+        so that a failed installation is retried in the next round.
+        Removal is best effort, the peer is always marked as not installed afterwards.
         """
         if modification == "append":
             action = "Installed"
@@ -166,34 +190,40 @@ class ConfigManager:
             action = "Removed"
             failed_action = "Removing"
 
-        with IPRoute() as ip:
-            try:
-                ip.fdb(
-                    modification,
-                    ifindex=ip.link_lookup(ifname=self.vx_interface)[0],
-                    # mac 00:00:00:00:00:00 means automatic learning
-                    lladdr="00:00:00:00:00:00",
-                    dst=re.sub(r"/\d+$", "", peer.lladdr),
-                )
-            except NetlinkError as e:
+        success = True
+
+        try:
+            ip.fdb(
+                modification,
+                ifindex=vx_index,
+                # mac 00:00:00:00:00:00 means automatic learning
+                lladdr="00:00:00:00:00:00",
+                dst=re.sub(r"/\d+$", "", peer.lladdr),
+            )
+        except NetlinkError as e:
+            # an already existing entry is fine when retrying a partially failed install
+            if not (modification == "append" and e.code == errno.EEXIST):
+                success = False
                 print_err(f"{failed_action} FDB entry failed for {peer.public_key} on {self.vx_interface}.")
                 print_err(str(e))
 
-        with IPRoute() as ip:
-            try:
-                ip.route(
-                    "add" if modification == "append" else "del",
-                    dst=peer.lladdr,
-                    oif=ip.link_lookup(ifname=self.wg_interface)[0],
-                    proto=RT_PROTO_ID,
-                )
-            except NetlinkError as e:
-                print_err(f"{failed_action} ip route failed for {peer.public_key} on {self.wg_interface}.")
-                print_err(str(e))
+        try:
+            ip.route(
+                # replace is idempotent, so retrying a partially failed install works
+                "replace" if modification == "append" else "del",
+                dst=peer.lladdr,
+                oif=wg_index,
+                proto=RT_PROTO_ID,
+            )
+        except NetlinkError as e:
+            success = False
+            print_err(f"{failed_action} ip route failed for {peer.public_key} on {self.wg_interface}.")
+            print_err(str(e))
 
-        print(f'{action} route and fdb entry for {peer.public_key} ({self.wg_interface}, {self.vx_interface})')
+        if success:
+            print(f'{action} route and fdb entry for {peer.public_key} ({self.wg_interface}, {self.vx_interface})')
 
-        peer.is_installed = modification == "append"
+        peer.is_installed = modification == "append" and success
 
 
 def check_iface_type(iface, type):
